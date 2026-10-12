@@ -45,6 +45,8 @@
 # =============================================================================
 set -uo pipefail
 
+DWLSETUP_VER="2.2"
+
 : "${SKIP:=}"
 : "${AUR_REVIEW:=0}"
 : "${WITH_CHAOTIC:=0}"
@@ -149,11 +151,17 @@ if [[ "$AUR_REVIEW" == "1" ]]; then PARU_FLAGS=(); else PARU_FLAGS=(--noconfirm 
 paru_healthy() { command -v paru >/dev/null && paru --version >/dev/null 2>&1; }
 
 fix_paru() {  # reinstall paru-bin (fast); fall back to a source build (always links right)
-  local tmp; tmp="$(mktemp -d)"
+  local tmp _p; tmp="$(mktemp -d)"
   info "reinstalling paru (libalpm mismatch after an upgrade is the usual cause)"
-  # paru and paru-bin conflict: remove both first so pacman never blocks on the
-  # "Remove paru-bin? [y/N]" question (unanswerable under --noconfirm).
-  sudo pacman -Rns --noconfirm paru paru-bin 2>/dev/null || true
+  # paru and paru-bin conflict: remove each one separately FIRST, so pacman
+  # never blocks on the "Remove paru-bin? [y/N]" question (unanswerable under
+  # --noconfirm). Separate commands matter: one unknown target name aborts a
+  # combined removal and the other package would survive.
+  for _p in paru paru-bin paru-debug; do
+    if pacman -Qq "$_p" >/dev/null 2>&1; then
+      sudo pacman -Rns --noconfirm "$_p" 2>/dev/null || warn "could not remove $_p (continuing anyway)"
+    fi
+  done
   if git clone --depth=1 https://aur.archlinux.org/paru-bin.git "$tmp/paru-bin" 2>/dev/null \
      && (cd "$tmp/paru-bin" && makepkg -si --noconfirm) && paru_healthy; then
     rm -rf "$tmp"; info "paru works again"; return 0
@@ -245,6 +253,7 @@ preflight() {
     exec > >(tee -a "$HOME/arch-dwl-setup.log") 2>&1
   fi
   info "user=$USER  AUR_REVIEW=$AUR_REVIEW  theme=$THEME  skip='${SKIP}'"
+  info "arch-dwl-setup.sh v$DWLSETUP_VER (if this line is missing, your copy is outdated - re-copy the file)"
 }
 
 # ---------------------------------------------------------- 1. pacman/base ---
