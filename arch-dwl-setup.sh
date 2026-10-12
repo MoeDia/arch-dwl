@@ -27,7 +27,7 @@
 #    DWL_SRC=~/.local/src/dwl
 #    KB_LAYOUT=us,ara      KB_OPTIONS=grp:alt_shift_toggle
 #    TORRENT_PORT=         open this TCP/UDP port in ufw (e.g. 6881)
-#    WITH_BROWSER=1        install Firefox (VA-API hw decode + Widevine for streaming)
+#    WITH_BROWSER=0        install Firefox (opt-in only; VA-API hw decode + Widevine)
 #    WITH_VLC=0            also install VLC (pulls Qt; mpv already covers everything)
 #    WITH_DISC_DECRYPT=0   libdvdcss + libaacs (disc-decryption libs; check your local law)
 #    WITH_UNVERIFIED=0     also try splatty / nikki-cli (could not confirm they exist)
@@ -57,7 +57,7 @@ set -uo pipefail
 : "${KB_LAYOUT:=us,ara}"
 : "${KB_OPTIONS:=grp:alt_shift_toggle}"
 : "${TORRENT_PORT:=}"
-: "${WITH_BROWSER:=1}"
+: "${WITH_BROWSER:=0}"
 : "${WITH_VLC:=0}"
 : "${WITH_DISC_DECRYPT:=0}"
 : "${WITH_UNVERIFIED:=0}"
@@ -1373,6 +1373,69 @@ pkg_source() {  # echoes repo|aur|provided|missing
   else echo missing; fi
 }
 
+check_command_coverage() {
+  # Every command the keybinds and helper scripts call must resolve to an
+  # installable package (repo/AUR) - catches typos and renamed packages early.
+  # NPM:/SRC: entries are special-cased (not pacman packages).
+  log "Critical command coverage"
+  local entry cmd pkg src miss=0
+  local -a map=(
+    "swayosd-client:swayosd" "brightnessctl:brightnessctl"
+    "grim:grim" "slurp:slurp" "satty:satty" "wf-recorder:wf-recorder"
+    "wmenu:wmenu" "rofi:rofi" "foot:foot" "mako:mako" "waybar:waybar"
+    "nmcli:networkmanager" "nmtui:networkmanager" "bluetoothctl:bluez-utils" "blueman-manager:blueman"
+    "playerctl:playerctl" "pavucontrol:pavucontrol" "pamixer:pamixer"
+    "wl-copy:wl-clipboard" "wl-paste:wl-clipboard" "cliphist:cliphist"
+    "swayidle:swayidle" "swaylock:swaylock" "udiskie:udiskie"
+    "hyprpolkitagent:hyprpolkitagent" "hyprpicker:hyprpicker"
+    "wlr-randr:wlr-randr" "wttrbar:wttrbar|A" "awww:awww|A"
+    "mpv:mpv" "ffmpeg:ffmpeg" "ffprobe:ffmpeg" "yt-dlp:yt-dlp" "mediainfo:mediainfo"
+    "mkvmerge:mkvtoolnix-cli" "mkvextract:mkvtoolnix-cli" "mkvinfo:mkvtoolnix-cli"
+    "gst-inspect-1.0:gstreamer" "gst-launch-1.0:gstreamer"
+    "abiword:abiword" "ssconvert:gnumeric" "zathura:zathura" "xournalpp:xournalpp" "presenterm:presenterm"
+    "qpdf:qpdf" "mutool:mupdf-tools" "pdfimages:poppler"
+    "magick:imagemagick" "montage:imagemagick" "chafa:chafa" "imv:imv"
+    "oxipng:oxipng" "jpegoptim:jpegoptim" "fastfetch:fastfetch" "calc:calc"
+    "zstd:zstd" "pigz:pigz" "aunpack:atool" "gsimplecal:gsimplecal"
+    "aria2c:aria2" "prowlarr:prowlarr-bin|A"
+    "steam:steam" "gamescope:gamescope" "gamemoderun:gamemode" "mangohud:mangohud" "goverlay:goverlay"
+    "protontricks:protontricks" "winetricks:winetricks"
+    "solaar:solaar" "ratbagctl:libratbag" "openrgb:openrgb" "liquidctl:liquidctl"
+    "easyeffects:easyeffects" "gammastep:gammastep" "batsignal:batsignal"
+    "nvim:neovim" "lazygit:lazygit" "node:nodejs" "npm:nodejs" "jq:jq" "curl:curl" "git:git"
+    "wlogout:wlogout|A" "localsend_app:localsend-bin|A" "tclock:clock-tui|A"
+    "superseedr:superseedr-bin|A" "syncplay-nogui:syncplay-nogui|A" "spotatui:spotatui-bin|A" "endcord:endcord|A"
+    "docker:docker" "timeshift:timeshift" "greetd:greetd" "tuigreet:greetd-tuigreet"
+    "claude:NPM:nodejs" "dwl:SRC:built by the dwl phase" "dwl-rebuild:SRC:built by the dwl phase"
+    "dwl-wallpaper:SRC:written by the theme phase" "dwl-quick:SRC:written by the theme phase"
+    "dwl-screenshot:SRC:written by the theme phase" "dwl-help:SRC:written by the theme phase"
+  )
+  for entry in "${map[@]}"; do
+    cmd="${entry%%:*}"; pkg="${entry#*:}"
+    if [[ "$pkg" == NPM:* ]]; then
+      src="$(pkg_source "${pkg#NPM:}")"
+      [[ "$src" == missing ]] && { printf '  \033[31mFAIL\033[0m %s needs npm package host %s (missing)\n' "$cmd" "${pkg#NPM:}"; miss=$((miss+1)); } \
+        || printf '  \033[32mOK\033[0m   %-22s via npm (host %s present)\n' "$cmd" "${pkg#NPM:}"
+      continue
+    fi
+    if [[ "$pkg" == SRC:* ]]; then printf '  \033[36msrc\033[0m   %-22s %s\n' "$cmd" "${pkg#SRC:}"; continue; fi
+    if [[ "$pkg" == *"|A" ]]; then
+      pkg="${pkg%|A}"
+      src="$(pkg_source "$pkg")"
+      if [[ "$src" == missing ]]; then
+        # try AUR explicitly (pkg_source already does, but be explicit for groups)
+        if command -v paru >/dev/null && paru -Si "$pkg" >/dev/null 2>&1; then src="aur"; fi
+      fi
+    else
+      src="$(pkg_source "$pkg")"
+    fi
+    if [[ "$src" == missing ]]; then printf '  \033[31mFAIL\033[0m %s <- %s NOT FOUND\n' "$cmd" "$pkg"; miss=$((miss+1))
+    else printf '  \033[32mOK\033[0m   %-22s <- %s (%s)\n' "$cmd" "$pkg" "$src"; fi
+  done
+  log "Command coverage: $miss missing provider(s)"
+  return $((miss > 0))
+}
+
 check_packages() {
   command -v pacman >/dev/null || die "pacman not found - run this on Arch."
   local have_paru=0; command -v paru >/dev/null && have_paru=1
@@ -1381,6 +1444,9 @@ check_packages() {
 
   log "Package availability + dependency pre-check (installs nothing)"
   info "sync DB age: $(date -r /var/lib/pacman/sync/extra.db '+%F %R' 2>/dev/null || echo unknown). Run 'sudo pacman -Syu' first for a fresh answer."
+  local dbage=999999999
+  [[ -f /var/lib/pacman/sync/extra.db ]] && dbage=$(($(date +%s) - $(stat -c %Y /var/lib/pacman/sync/extra.db)))
+  (( dbage > 14*86400 )) && warn "sync DBs are over 14 days old (or missing) - run 'sudo pacman -Sy' first or every result above is suspect"
   ((have_paru)) || warn "paru not installed yet: AUR packages can't be checked until it is (run the real script once, SKIP=everything-but-paru works)."
 
   for arr in "${PKG_ARRAYS[@]}" "${OPT_ARRAYS[@]}"; do
@@ -1453,6 +1519,7 @@ check_packages() {
   fi
 
   log "Summary: $n entries checked, $missing problem(s)"
+  check_command_coverage || missing=$((missing+1))
   ((missing == 0))
 }
 
@@ -1965,10 +2032,34 @@ verify_extras() {
   [[ -n "$pc" ]] && { pkg-config --exists "$pc" && t_pass "dwl's wlroots dependency ($pc) is installed" || t_fail "dwl needs $pc but it is missing"; }
 }
 
+verify_health() {
+  t_head "System health (disk, memory, failed units, clock)"
+  local avail_gb mem_gb failed
+  avail_gb="$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')"; avail_gb="${avail_gb:-0}"
+  if (( avail_gb < 2 )); then t_fail "only ${avail_gb}G free on / - AUR builds and snapshots need room"
+  elif (( avail_gb < 10 )); then t_warn "only ${avail_gb}G free on / - tight for AUR builds + snapshots"
+  else t_pass "disk: ${avail_gb}G free on /"; fi
+  mem_gb="$(free -g 2>/dev/null | awk '/^Mem:/{print $2}')"; mem_gb="${mem_gb:-0}"
+  if (( mem_gb < 2 )); then t_warn "only ${mem_gb}G RAM - browsers/games will struggle"
+  else t_pass "memory: ${mem_gb}G RAM"; fi
+  failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')"
+  if [[ -z "$failed" ]]; then t_pass "no failed system units"
+  else t_fail "failed units: $(tr '\n' ' ' <<<"$failed")"; fi
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    failed="$(systemctl --user --failed --no-legend --plain 2>/dev/null | awk '{print $1}')"
+    [[ -z "$failed" ]] && t_pass "no failed user units" || t_warn "failed user units: $(tr '\n' ' ' <<<"$failed")"
+  else t_skip "user units check (no user session bus here)"; fi
+  if command -v timedatectl >/dev/null; then
+    [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]] \
+      && t_pass "clock synced (NTP)" || t_warn "clock not NTP-synced - TLS/cert errors will follow (enable systemd-timesyncd)"
+  fi
+  info "load: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null), uptime: $(uptime -p 2>/dev/null)"
+}
+
 verify_all() {
   log "Verification suite  ($(date '+%F %R'))"
   sudo -v 2>/dev/null || true
-  verify_packages; verify_binaries; verify_files; verify_services
+  verify_packages; verify_binaries; verify_files; verify_services; verify_health
   verify_gpu; verify_codecs; verify_fonts_shell; verify_dwl_smoke; verify_office; verify_images
   verify_torrent; verify_gaming; verify_theme; verify_hardware; verify_ai; verify_monitor; verify_extras
   printf '\n\033[1mResult:\033[0m  %d passed, %d failed, %d warnings, %d skipped\n' "$T_PASS" "$T_FAIL" "$T_WARN" "$T_SKIP"
