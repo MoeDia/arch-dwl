@@ -45,7 +45,7 @@
 # =============================================================================
 set -uo pipefail
 
-DWLSETUP_VER="2.2"
+DWLSETUP_VER="2.3"
 
 : "${SKIP:=}"
 : "${AUR_REVIEW:=0}"
@@ -151,17 +151,23 @@ if [[ "$AUR_REVIEW" == "1" ]]; then PARU_FLAGS=(); else PARU_FLAGS=(--noconfirm 
 paru_healthy() { command -v paru >/dev/null && paru --version >/dev/null 2>&1; }
 
 fix_paru() {  # reinstall paru-bin (fast); fall back to a source build (always links right)
-  local tmp _p; tmp="$(mktemp -d)"
+  local tmp _p left; tmp="$(mktemp -d)"
   info "reinstalling paru (libalpm mismatch after an upgrade is the usual cause)"
-  # paru and paru-bin conflict: remove each one separately FIRST, so pacman
-  # never blocks on the "Remove paru-bin? [y/N]" question (unanswerable under
-  # --noconfirm). Separate commands matter: one unknown target name aborts a
-  # combined removal and the other package would survive.
+  # Remove every paru variant FIRST, each in its own transaction, with -Rdd:
+  #  - one unknown name aborts a combined -Rns, letting the other survive;
+  #  - a plain -R can still block on the conflict question under --noconfirm;
+  #  - -Rdd skips all dependency checks. Safe here: paru is always a leaf
+  #    package (repo packages can never depend on an AUR helper).
   for _p in paru paru-bin paru-debug; do
     if pacman -Qq "$_p" >/dev/null 2>&1; then
-      sudo pacman -Rns --noconfirm "$_p" 2>/dev/null || warn "could not remove $_p (continuing anyway)"
+      sudo pacman -Rdd --noconfirm "$_p" 2>/dev/null || warn "could not remove $_p (continuing anyway)"
     fi
   done
+  left="$(pacman -Qq paru paru-bin paru-debug 2>/dev/null || true)"
+  if [[ -n "$left" ]]; then
+    rm -rf "$tmp"
+    die "cannot proceed: still installed and blocking reinstall: $left. Remove by hand, then re-run: sudo pacman -Rdd --noconfirm $left"
+  fi
   if git clone --depth=1 https://aur.archlinux.org/paru-bin.git "$tmp/paru-bin" 2>/dev/null \
      && (cd "$tmp/paru-bin" && makepkg -si --noconfirm) && paru_healthy; then
     rm -rf "$tmp"; info "paru works again"; return 0
