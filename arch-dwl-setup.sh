@@ -151,6 +151,9 @@ paru_healthy() { command -v paru >/dev/null && paru --version >/dev/null 2>&1; }
 fix_paru() {  # reinstall paru-bin (fast); fall back to a source build (always links right)
   local tmp; tmp="$(mktemp -d)"
   info "reinstalling paru (libalpm mismatch after an upgrade is the usual cause)"
+  # paru and paru-bin conflict: remove both first so pacman never blocks on the
+  # "Remove paru-bin? [y/N]" question (unanswerable under --noconfirm).
+  sudo pacman -Rns --noconfirm paru paru-bin 2>/dev/null || true
   if git clone --depth=1 https://aur.archlinux.org/paru-bin.git "$tmp/paru-bin" 2>/dev/null \
      && (cd "$tmp/paru-bin" && makepkg -si --noconfirm) && paru_healthy; then
     rm -rf "$tmp"; info "paru works again"; return 0
@@ -1235,12 +1238,17 @@ fi
 EOF
   cat <<'EOF' | theme_write 755 "$HOME/.local/bin/dwl-screenshot"
 #!/usr/bin/env bash
-# dwl-screenshot region|full - grim + slurp -> satty (annotate, then save)
+# dwl-screenshot region|full - grim (+slurp) -> clipboard AND satty (annotate, then save)
 set -uo pipefail
+shot="$(mktemp /tmp/dwl-shot-XXXXXX.png)"
 case "${1:-region}" in
-  region) grim -g "$(slurp)" - | satty -f - ;;
-  full)   grim - | satty -f - ;;
+  region) grim -g "$(slurp)" "$shot" ;;
+  full)   grim "$shot" ;;
 esac
+[[ -s "$shot" ]] || exit 1
+wl-copy -t image/png <"$shot" 2>/dev/null || true
+notify-send "screenshot" "copied to clipboard - annotate, then save" 2>/dev/null || true
+satty -f "$shot"
 EOF
   cat <<'EOF' | theme_write 755 "$HOME/.local/bin/dwl-quick"
 #!/usr/bin/env bash
@@ -1992,6 +2000,8 @@ verify_theme() {
     grep -qE 'static const int gapp(i|o)[hv] = 12;' "$DWL_SRC/config.h" && t_pass "window gaps set (12px)" || t_warn "gaps not set (genericgaps patch not applied?)"
   fi
   grep -q 'Dracula' "$HOME/.config/gtk-3.0/settings.ini" 2>/dev/null && t_pass "GTK theme set" || t_warn "GTK theme not set"
+  grep -q '^border-color=' "$HOME/.config/mako/config" 2>/dev/null \
+    && t_pass "mako themed (accent border, urgency colors)" || t_warn "mako config unthemed"
   grep -qE '^foreground=[0-9a-fA-F]{6}$' "$HOME/.config/foot/foot.ini" 2>/dev/null \
     && t_pass "foot colors in RRGGBB format (no #)" || t_warn "foot.ini foreground line unexpected"
   grep -q '^\[colors-dark\]$' "$HOME/.config/foot/foot.ini" 2>/dev/null \
