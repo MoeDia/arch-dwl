@@ -146,12 +146,38 @@ run_phase() { local n="$1"; shift; if skip "$n"; then log "Skipping phase: $n"; 
 
 if [[ "$AUR_REVIEW" == "1" ]]; then PARU_FLAGS=(); else PARU_FLAGS=(--noconfirm --skipreview); fi
 
+paru_healthy() { command -v paru >/dev/null && paru --version >/dev/null 2>&1; }
+
+fix_paru() {  # reinstall paru-bin (fast); fall back to a source build (always links right)
+  local tmp; tmp="$(mktemp -d)"
+  info "reinstalling paru (libalpm mismatch after an upgrade is the usual cause)"
+  if git clone --depth=1 https://aur.archlinux.org/paru-bin.git "$tmp/paru-bin" 2>/dev/null \
+     && (cd "$tmp/paru-bin" && makepkg -si --noconfirm) && paru_healthy; then
+    rm -rf "$tmp"; info "paru works again"; return 0
+  fi
+  warn "paru-bin is still broken (its prebuilt binary lags behind pacman?) - building paru from source, takes a few minutes"
+  if git clone --depth=1 https://aur.archlinux.org/paru.git "$tmp/paru" 2>/dev/null \
+     && (cd "$tmp/paru" && makepkg -si --noconfirm) && paru_healthy; then
+    rm -rf "$tmp"; info "paru works again (source build)"; return 0
+  fi
+  rm -rf "$tmp"; return 1
+}
+
 # Install via paru (handles repo + AUR). Batch first, then one-by-one so a single
 # bad/missing package never aborts the whole run.
 inst() {
   [[ $# -gt 0 ]] || return 0
   paru -S --needed "${PARU_FLAGS[@]}" "$@" && return 0
-  warn "Batch install failed, retrying one by one: $*"
+  if ! paru_healthy; then
+    warn "paru itself is broken - repairing it, then retrying the batch once"
+    if fix_paru; then
+      paru -S --needed "${PARU_FLAGS[@]}" "$@" && return 0
+    else
+      warn "paru repair failed - recording failures, fix paru by hand and re-run"
+    fi
+  else
+    warn "Batch install failed, retrying one by one: $*"
+  fi
   local p
   for p in "$@"; do
     paru -S --needed "${PARU_FLAGS[@]}" "$p" || { FAILED+=("$p"); warn "FAILED: $p"; }
@@ -245,19 +271,20 @@ phase_pacman() {
   grep -q '^\[multilib\]' /etc/pacman.conf || die "Could not enable [multilib] in /etc/pacman.conf."
   [[ "$WITH_CHAOTIC" == "1" ]] && setup_chaotic
   sudo pacman -Syu --noconfirm || die "System upgrade failed."
+  # A major pacman upgrade changes libalpm and can break a previously installed
+  # paru on the spot - repair it now, before anything tries to use it.
+  if command -v paru >/dev/null && ! paru_healthy; then
+    warn "the system upgrade broke the existing paru - repairing before continuing"
+    fix_paru || die "paru is broken after the upgrade and auto-repair failed. Fix it by hand, then re-run."
+  fi
   sudo pacman -S --needed --noconfirm base-devel git curl pacman-contrib || die "base-devel install failed."
   sudo systemctl enable --now paccache.timer fstrim.timer || warn "Could not enable paccache/fstrim timers."
 }
 
 phase_paru() {
   log "AUR helper (paru)"
-  if command -v paru >/dev/null; then info "paru already installed"; return 0; fi
-  local tmp; tmp="$(mktemp -d)"
-  # paru-bin = prebuilt; avoids a long Rust compile. Swap for 'paru' if you prefer building from source.
-  git clone --depth=1 https://aur.archlinux.org/paru-bin.git "$tmp/paru-bin" \
-    && (cd "$tmp/paru-bin" && makepkg -si --noconfirm) \
-    || die "Could not install paru."
-  rm -rf "$tmp"
+  if paru_healthy; then info "paru already installed and working"; return 0; fi
+  fix_paru || die "Could not install a working paru. Fix it by hand (see the book, 'paru broke after an upgrade'), then re-run."
 }
 
 # ------------------------------------------------------------ 2. security ----
@@ -1612,6 +1639,9 @@ verify_binaries() {
     if command -v awww-daemon >/dev/null || command -v swww-daemon >/dev/null; then t_pass "wallpaper daemon (awww/swww)"; else t_fail "no wallpaper daemon (awww-daemon / swww-daemon)"; fi
   else t_skip "wallpaper daemon (visual phase skipped)"; fi
   skip dwl || { [[ -x /usr/local/bin/dwl ]] && t_pass "dwl installed to /usr/local/bin" || t_fail "/usr/local/bin/dwl missing"; }
+  if skip paru; then t_skip "paru check (paru phase skipped)"
+  elif paru_healthy; then t_pass "paru works (libalpm links fine)"
+  else t_fail "paru is broken (libalpm mismatch?) - rebuild paru-bin, fallback: build paru from source"; fi
 }
 
 verify_files() {
