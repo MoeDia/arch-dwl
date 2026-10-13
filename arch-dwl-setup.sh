@@ -45,7 +45,7 @@
 # =============================================================================
 set -uo pipefail
 
-DWLSETUP_VER="2.3"
+DWLSETUP_VER="3.0"
 
 : "${SKIP:=}"
 : "${AUR_REVIEW:=0}"
@@ -180,25 +180,62 @@ fix_paru() {  # reinstall paru-bin (fast); fall back to a source build (always l
   rm -rf "$tmp"; return 1
 }
 
-# Install via paru (handles repo + AUR). Batch first, then one-by-one so a single
-# bad/missing package never aborts the whole run.
+# ---- pacman robustness ------------------------------------------------------
+pacman_unlock() {  # remove a stale db.lck (left by a crashed/killed pacman), never a live one
+  if [[ -e /var/lib/pacman/db.lck ]]; then
+    if pgrep -x pacman >/dev/null 2>&1 || pgrep -x paru >/dev/null 2>&1; then
+      info "waiting for another pacman to finish..."
+      local i; for i in $(seq 1 60); do [[ -e /var/lib/pacman/db.lck ]] || return 0; sleep 5; done
+      die "pacman has been locked for 5 minutes by another process - finish it, then re-run."
+    fi
+    warn "removing stale pacman lock (no pacman process running)"
+    sudo rm -f /var/lib/pacman/db.lck
+  fi
+}
+
+pac() {  # sudo pacman with stale-lock cleanup + 3 tries (mirror hiccups, slow syncs)
+  local try
+  for try in 1 2 3; do
+    pacman_unlock
+    sudo pacman "$@" && return 0
+    (( try < 3 )) && { warn "pacman failed (attempt $try/3) - refreshing databases and retrying"; sudo pacman -Syy --noconfirm >/dev/null 2>&1 || true; sleep 3; }
+  done
+  return 1
+}
+
+is_repo_pkg() { pacman -Si "$1" >/dev/null 2>&1 || pacman -Sp "$1" >/dev/null 2>&1; }
+
+paru_ready() {  # make sure an AUR helper is usable right now; repair if not
+  paru_healthy && return 0
+  warn "paru is missing or broken - repairing it before building AUR packages"
+  fix_paru
+}
+
+# Install packages. Official-repo packages go through pacman directly (a broken
+# AUR helper can never block them); only true AUR packages touch paru.
+# Batch first, then one-by-one so a single bad name never aborts a whole phase.
 inst() {
   [[ $# -gt 0 ]] || return 0
-  paru -S --needed "${PARU_FLAGS[@]}" "$@" && return 0
-  if ! paru_healthy; then
-    warn "paru itself is broken - repairing it, then retrying the batch once"
-    if fix_paru; then
-      paru -S --needed "${PARU_FLAGS[@]}" "$@" && return 0
-    else
-      warn "paru repair failed - recording failures, fix paru by hand and re-run"
+  local p; local -a repo=() aur=()
+  for p in "$@"; do if is_repo_pkg "$p"; then repo+=("$p"); else aur+=("$p"); fi; done
+  if ((${#repo[@]})); then
+    if ! pac -S --needed --noconfirm "${repo[@]}"; then
+      warn "repo batch failed, retrying one by one"
+      for p in "${repo[@]}"; do pac -S --needed --noconfirm "$p" || { FAILED+=("$p"); warn "FAILED: $p"; }; done
     fi
-  else
-    warn "Batch install failed, retrying one by one: $*"
   fi
-  local p
-  for p in "$@"; do
-    paru -S --needed "${PARU_FLAGS[@]}" "$p" || { FAILED+=("$p"); warn "FAILED: $p"; }
-  done
+  if ((${#aur[@]})); then
+    if ! paru_ready; then
+      for p in "${aur[@]}"; do FAILED+=("$p"); done
+      warn "no working paru - skipped AUR packages: ${aur[*]}"
+      return 0
+    fi
+    pacman_unlock
+    if ! paru -S --needed "${PARU_FLAGS[@]}" "${aur[@]}"; then
+      warn "AUR batch failed, retrying one by one"
+      for p in "${aur[@]}"; do paru -S --needed "${PARU_FLAGS[@]}" "$p" || { FAILED+=("$p"); warn "FAILED: $p"; }; done
+    fi
+  fi
   return 0
 }
 
@@ -206,7 +243,11 @@ inst() {
 inst_any() {
   local p
   for p in "$@"; do
-    if paru -S --needed "${PARU_FLAGS[@]}" "$p"; then return 0; fi
+    if is_repo_pkg "$p"; then
+      pac -S --needed --noconfirm "$p" && return 0
+    elif paru_ready && paru -S --needed "${PARU_FLAGS[@]}" "$p"; then
+      return 0
+    fi
   done
   FAILED+=("one of: $*")
   warn "FAILED: none of these installed: $*"
@@ -243,6 +284,16 @@ preflight() {
   log "Preflight"
   [[ $EUID -ne 0 ]] || die "Run as your normal user, not root (makepkg refuses root; sudo is used where needed)."
   [[ -f /etc/arch-release ]] || die "This is not Arch Linux."
+  command -v pacman >/dev/null || die "pacman not found."
+  local free_gb; free_gb="$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')"
+  (( ${free_gb:-0} >= 12 )) || die "Only ${free_gb:-?}G free on /. This setup needs ~12G (packages + AUR builds + Steam runtime). Free space first."
+  if ! id -nG "$USER" | grep -qw wheel && ! sudo -l -n >/dev/null 2>&1; then
+    warn "you are not in 'wheel' - sudo may refuse. If it does: as root, 'usermod -aG wheel $USER' and enable %wheel in visudo."
+  fi
+  if [[ "$(date +%Y)" -lt 2025 ]]; then
+    warn "system clock looks wrong ($(date)) - TLS and package signatures will fail. Enabling time sync."
+    sudo timedatectl set-ntp true 2>/dev/null || true
+  fi
   command -v sudo >/dev/null || die "sudo is missing. As root: pacman -S sudo, then add yourself to wheel."
   sudo -v || die "sudo authentication failed."
   keepalive
@@ -288,21 +339,27 @@ phase_pacman() {
   fi
   grep -q '^\[multilib\]' /etc/pacman.conf || die "Could not enable [multilib] in /etc/pacman.conf."
   [[ "$WITH_CHAOTIC" == "1" ]] && setup_chaotic
-  sudo pacman -Syu --noconfirm || die "System upgrade failed."
-  # A major pacman upgrade changes libalpm and can break a previously installed
-  # paru on the spot - repair it now, before anything tries to use it.
-  if command -v paru >/dev/null && ! paru_healthy; then
-    warn "the system upgrade broke the existing paru - repairing before continuing"
-    fix_paru || die "paru is broken after the upgrade and auto-repair failed. Fix it by hand, then re-run."
-  fi
-  sudo pacman -S --needed --noconfirm base-devel git curl pacman-contrib || die "base-devel install failed."
+  # Fresh/old installs often carry an outdated keyring -> "invalid or corrupted
+  # package (PGP signature)". Refresh the keyring FIRST, then the full upgrade.
+  pac -Sy --needed --noconfirm archlinux-keyring || warn "keyring refresh failed - continuing, the upgrade may complain about signatures"
+  # Always a FULL upgrade (-Syu): partial upgrades are what cause library
+  # mismatches like 'libalpm.so.15: cannot open shared object file'.
+  pac -Syu --noconfirm || die "System upgrade failed 3 times (mirrors? disk full? run 'sudo pacman -Syu' by hand to see why)."
+  pac -S --needed --noconfirm base-devel git curl pacman-contrib || die "base-devel install failed."
   sudo systemctl enable --now paccache.timer fstrim.timer || warn "Could not enable paccache/fstrim timers."
+  # A pacman upgrade changes libalpm and can break an installed paru on the spot.
+  # base-devel/git exist now, so repair is possible. Not fatal: repo packages use
+  # pacman directly; only AUR packages need paru.
+  if command -v paru >/dev/null && ! paru_healthy; then
+    warn "the system upgrade broke the existing paru - repairing now"
+    fix_paru || warn "paru repair failed here; the paru phase will try again (repo packages are unaffected)"
+  fi
 }
 
 phase_paru() {
   log "AUR helper (paru)"
-  if paru_healthy; then info "paru already installed and working"; return 0; fi
-  fix_paru || die "Could not install a working paru. Fix it by hand (see the book, 'paru broke after an upgrade'), then re-run."
+  if paru_healthy; then info "paru $(paru --version 2>/dev/null | head -1 | awk '{print $2}') installed and working"; return 0; fi
+  fix_paru || warn "Could not get a working paru. Official-repo packages still install; AUR packages will be listed as FAILED. Fix by hand: see the book, 'paru broke after an upgrade', then re-run."
 }
 
 # ------------------------------------------------------------ 2. security ----
@@ -408,6 +465,17 @@ phase_base() {
 # ---------------------------------------------------------------- 5. dwl -----
 dwl_build() { ( cd "$DWL_SRC" && make clean >/dev/null && make -j"$(nproc)" ); }
 
+wlroots_pkg_for() {  # echo the repo package providing wlroots <minor>, e.g. 0.19 -> wlroots0.19
+  local v="$1" cand pv
+  for cand in "wlroots${v}" wlroots; do
+    pv="$(pacman -Si "$cand" 2>/dev/null | awk -F': *' '/^Version/{print $2; exit}')"
+    [[ -n "$pv" ]] || continue
+    # versioned packages (wlroots0.19) are exact by name; plain 'wlroots' must match the minor
+    if [[ "$cand" != wlroots || "$pv" == "$v".* || "$pv" == "$v" ]]; then echo "$cand"; return 0; fi
+  done
+  return 1
+}
+
 phase_dwl() {
   log "Building dwl from source"
   inst "${P_DWL_DEPS[@]}"
@@ -418,17 +486,30 @@ phase_dwl() {
   else
     rm -rf "$DWL_SRC"
     git clone https://codeberg.org/dwl/dwl.git "$DWL_SRC" || die "Could not clone dwl."
-    local ref="$DWL_REF"
-    [[ -n "$ref" ]] || ref="$(git -C "$DWL_SRC" tag --list 'v*' | sort -V | tail -1)"
-    [[ -n "$ref" ]] || ref="main"
+    # Pick a dwl release whose wlroots version Arch actually ships. dwl pins one
+    # wlroots minor per release (config.mk: wlroots-0.NN); the newest tag is often
+    # ahead of the repos right after a dwl release, or behind after a wlroots bump.
+    local ref="$DWL_REF" wlpkg="" t pcv
+    if [[ -z "$ref" ]]; then
+      for t in $(git -C "$DWL_SRC" tag --list 'v*' | sort -rV | head -8); do
+        pcv="$(git -C "$DWL_SRC" show "$t:config.mk" 2>/dev/null | grep -oE 'wlroots-[0-9]+\.[0-9]+' | head -1)"
+        pcv="${pcv#wlroots-}"
+        [[ -n "$pcv" ]] || continue
+        wlpkg="$(wlroots_pkg_for "$pcv")"
+        if [[ -n "$wlpkg" ]]; then ref="$t"; info "dwl $t pairs with wlroots $pcv -> package $wlpkg"; break; fi
+        info "dwl $t needs wlroots $pcv - not in the repos, trying an older dwl release"
+      done
+      [[ -n "$ref" ]] || die "no recent dwl release matches any wlroots in the repos. Set DWL_REF=main or a specific tag and re-run."
+    fi
     git -C "$DWL_SRC" checkout -q "$ref" || die "No such dwl ref: $ref"
     info "dwl ref: $ref"
 
-    # Install the wlroots version this dwl ref was written for.
+    # Install exactly the wlroots this ref was written for.
     local pc ver; pc="$(grep -oE 'wlroots-[0-9]+\.[0-9]+' "$DWL_SRC/config.mk" | head -1)"; ver="${pc#wlroots-}"
-    if [[ -n "$ver" ]]; then inst_any "wlroots${ver}" wlroots; else inst wlroots; fi
+    [[ -n "$wlpkg" ]] || wlpkg="$(wlroots_pkg_for "$ver")"
+    if [[ -n "$wlpkg" ]]; then inst "$wlpkg"; else inst_any "wlroots${ver}" wlroots; fi
     if [[ -n "$pc" ]] && ! pkg-config --exists "$pc"; then
-      die "dwl $ref needs $pc but it is not installed. Try DWL_REF=<an older tag matching your wlroots>."
+      die "dwl $ref needs $pc but it is not installed (DWL_REF pinned to an incompatible tag?). Unset DWL_REF to auto-pick a matching release."
     fi
 
     # Patches. Applied only if they apply cleanly; conflicts are skipped, not forced.
@@ -695,6 +776,48 @@ theme_palette() {  # sets BG BG2 BG3 FG CMT ACC ACC2 OK WARN ERR YEL CYN ORN
   ANSI_ACTION='bright-blue'; ANSI_BUTTON='bright-red'; ANSI_CONTAINER='black'
 }
 
+theme_icons() {  # Nerd Font (Material Design) glyphs as raw UTF-8 bytes:
+  # printf '\xNN' works in ANY locale (bash's $'\U...' needs a UTF-8 locale,
+  # which a fresh minimal install may not have yet).
+  I_MUSIC="$(printf '\xf3\xb0\x9d\x9a')"      # nf-md-music U+F075A
+  I_PAUSE="$(printf '\xf3\xb0\x8f\xa4')"      # nf-md-pause U+F03E4
+  I_ETH="$(printf '\xf3\xb0\x88\x80')"        # nf-md-ethernet U+F0200
+  I_OFFLINE="$(printf '\xf3\xb0\x8c\x98')"    # nf-md-lan_disconnect U+F0318
+  I_BT="$(printf '\xf3\xb0\x82\xaf')"         # nf-md-bluetooth U+F00AF
+  I_BT_OFF="$(printf '\xf3\xb0\x82\xb2')"     # nf-md-bluetooth_off U+F00B2
+  I_BT_ON="$(printf '\xf3\xb0\x82\xb1')"      # nf-md-bluetooth_connect U+F00B1
+  I_VOL="$(printf '\xf3\xb0\x95\xbe')"        # nf-md-volume_high U+F057E
+  I_MUTE="$(printf '\xf3\xb0\x96\x81')"       # nf-md-volume_off U+F0581
+  I_CAL="$(printf '\xf3\xb0\x83\xad')"        # nf-md-calendar U+F00ED
+  I_CLOCK="$(printf '\xf3\xb0\xa5\x94')"      # nf-md-clock_outline U+F0954
+  I_VOLD="$(printf '\xf3\xb0\x95\xbf')"       # nf-md-volume_low U+F057F
+  I_BRIGHT="$(printf '\xf3\xb0\x83\xa0')"     # nf-md-brightness_7 U+F00E0
+  I_DIM="$(printf '\xf3\xb0\x83\x9e')"        # nf-md-brightness_5 U+F00DE
+  I_NETCFG="$(printf '\xf3\xb0\x8c\x97')"     # nf-md-lan U+F0317
+  I_BTCFG="$(printf '\xf3\xb0\x82\xb3')"      # nf-md-bluetooth_settings U+F00B3
+  I_NIGHT="$(printf '\xf3\xb0\x96\x94')"      # nf-md-weather_night U+F0594
+  I_SHOT="$(printf '\xf3\xb0\x86\x9e')"       # nf-md-crop U+F019E
+  I_SCREEN="$(printf '\xf3\xb0\x8d\xb9')"     # nf-md-monitor U+F0379
+  I_WALL="$(printf '\xf3\xb0\x8b\xa9')"       # nf-md-image U+F02E9
+  I_WALLS="$(printf '\xf3\xb0\x8b\xb9')"      # nf-md-image_multiple U+F02F9
+  I_LOCK="$(printf '\xf3\xb0\x8c\xbe')"       # nf-md-lock U+F033E
+  I_POWER="$(printf '\xf3\xb0\x90\xa5')"      # nf-md-power U+F0425
+}
+
+theme_helpers_env() {  # ~/.config/dwl/theme.sh - sourced by dwl-quick/-help/-wallpaper
+  cat <<EOF | theme_write 644 "$HOME/.config/dwl/theme.sh"
+# written by arch-dwl-setup.sh (theme: $THEME) - sourced by the dwl-* helpers
+I_VOL='$I_VOL'; I_VOLD='$I_VOLD'; I_MUTE='$I_MUTE'
+I_BRIGHT='$I_BRIGHT'; I_DIM='$I_DIM'
+I_ETH='$I_ETH'; I_NETCFG='$I_NETCFG'
+I_BT='$I_BT'; I_BTCFG='$I_BTCFG'
+I_NIGHT='$I_NIGHT'; I_SHOT='$I_SHOT'; I_SCREEN='$I_SCREEN'
+I_WALL='$I_WALL'; I_WALLS='$I_WALLS'
+I_LOCK='$I_LOCK'; I_POWER='$I_POWER'
+WMENU_ARGS=(-f "JetBrainsMono Nerd Font 11" -N "${BG#\#}" -n "${FG#\#}" -M "${ACC#\#}" -m "${BG#\#}" -S "${ACC#\#}" -s "${BG#\#}")
+EOF
+}
+
 theme_write() {  # theme_write mode "path" < content   (respects THEME_FORCE)
   local mode="$1" f="$2"
   if [[ -e "$f" && "$THEME_FORCE" != "1" ]]; then cat >/dev/null; info "exists, left untouched: $f"; return 0; fi
@@ -787,6 +910,8 @@ phase_theme() {
   [[ "${THEME:-none}" == "none" ]] && { log "Theme: none requested"; return 0; }
   log "Theme: $THEME (dracula-style, everything consistent)"
   theme_palette
+  theme_icons
+  theme_helpers_env
 
   inst_groups "${A_THEME[@]}"   # dracula-gtk-theme, dracula-cursors-git, dracula-grub-theme-git
 
@@ -846,8 +971,11 @@ EOF
 {
     "layer": "top",
     "position": "top",
-    "height": 32,
-    "spacing": 4,
+    "height": 34,
+    "margin-top": 8,
+    "margin-left": 8,
+    "margin-right": 8,
+    "spacing": 0,
     "modules-left": ["dwl/tags", "dwl/title"],
     "modules-center": ["mpris"],
     "modules-right": ["custom/weather", "network", "bluetooth", "pulseaudio", "clock", "tray"],
@@ -859,8 +987,8 @@ EOF
         "format": "{title}"
     },
     "mpris": {
-        "format": "♪ {title} — {artist}",
-        "format-paused": "♪ {title} — {artist}",
+        "format": "$I_MUSIC  {title} · {artist}",
+        "format-paused": "$I_PAUSE  {title} · {artist}",
         "max-length": 70,
         "tooltip-format": "{player} · {title} · {album}"
     },
@@ -868,31 +996,32 @@ EOF
         "format": "{}°C",
         "tooltip": true,
         "interval": 3600,
-        "exec": "wttrbar",
+        "exec": "wttrbar --nerd --hide-conditions",
         "return-type": "json"
     },
     "network": {
-        "format-ethernet": "🌐 {ifname} {ipaddr}",
-        "format-disconnected": "🌐 off",
+        "format-ethernet": "$I_ETH  {ipaddr}",
+        "format-disconnected": "$I_OFFLINE  offline",
         "tooltip-format": "{ifname}: {ipaddr}/{cidr}"
     },
     "bluetooth": {
-        "format": "🔵 off",
-        "format-on": "🔵 on",
-        "format-connected": "🔵 {num_connections}",
-        "tooltip-format": "{status}"
+        "format": "$I_BT_OFF",
+        "format-on": "$I_BT",
+        "format-connected": "$I_BT_ON  {num_connections}",
+        "tooltip-format": "{status}",
+        "on-click": "blueman-manager"
     },
     "pulseaudio": {
-        "format": "🔊 {volume}%",
-        "format-muted": "🔇 muted",
+        "format": "$I_VOL  {volume}%",
+        "format-muted": "$I_MUTE  muted",
         "on-click": "pavucontrol",
         "tooltip": false
     },
     "clock": {
-        "format": "📅 {:%a %d %b %H:%M:%S}",
+        "format": "$I_CLOCK  {:%a %d %b  %H:%M:%S}",
         "interval": 1,
         "on-click": "gsimplecal",
-        "tooltip-format": "{:%B %Y}"
+        "tooltip-format": "$I_CAL  {:%B %Y}"
     },
     "tray": {
         "spacing": 8
@@ -901,63 +1030,83 @@ EOF
 EOF
   cat <<EOF | theme_write 644 "$HOME/.config/waybar/style.css"
 /* waybar - written by arch-dwl-setup.sh (theme: $THEME) */
+/* Design: floating bar, three rounded panels, 4px rhythm, one accent. */
 * {
     font-family: "JetBrainsMono Nerd Font";
     font-size: 12px;
+    font-weight: 500;
     min-height: 0;
     border: none;
     border-radius: 0;
 }
 window#waybar {
-    background: rgba(40, 42, 54, 0.85);
+    background: transparent;
     color: $FG;
 }
-#workspaces,
 .modules-left, .modules-center, .modules-right {
-    padding: 0 6px;
+    background: alpha($BG, 0.92);
+    border: 1px solid alpha($BG3, 0.9);
+    border-radius: 10px;
+    padding: 0 4px;
 }
-.modules-left > widget > label { color: $FG; }
 #tags button {
     color: $CMT;
     background: transparent;
-    margin: 3px 2px;
-    padding: 0 10px;
-    border-radius: 4px;
+    margin: 4px 2px;
+    padding: 0 8px;
+    border-radius: 6px;
 }
-#tags button.occupied { color: $FG; background: $BG3; }
-#tags button.focused { color: $BG; background: $ACC; font-weight: bold; }
-#title { color: $FG; padding: 0 10px; }
+#tags button.occupied { color: $FG; }
+#tags button.focused { color: $BG; background: $ACC; font-weight: 700; }
+#tags button.urgent { color: $BG; background: $ERR; }
+#title, #mpris, #custom-weather, #network, #bluetooth, #pulseaudio, #clock, #tray {
+    padding: 0 12px;
+}
+#title { color: $FG; }
 #mpris { color: $ACC2; }
+#mpris.paused { color: $CMT; }
 #custom-weather { color: $YEL; }
 #network { color: $CYN; }
-#bluetooth { color: $CYN; }
+#network.disconnected { color: $ERR; }
+#bluetooth { color: $ACC; }
+#bluetooth.off, #bluetooth.disabled { color: $CMT; }
 #pulseaudio { color: $OK; }
-#clock { color: $CYN; }
-#tray { padding: 0 4px; }
-#tray menu { background: $BG; color: $FG; }
-label:disabled { color: $CMT; }
+#pulseaudio.muted { color: $CMT; }
+#clock { color: $FG; font-weight: 700; }
+#tray menu { background: $BG; color: $FG; border: 1px solid $BG3; border-radius: 8px; }
+tooltip { background: $BG; border: 1px solid $ACC; border-radius: 8px; }
+tooltip label { color: $FG; }
 EOF
 
   # ---- mako ----
   cat <<EOF | theme_write 644 "$HOME/.config/mako/config"
 # mako - written by arch-dwl-setup.sh (theme: $THEME)
 font=JetBrainsMono Nerd Font 11
-background-color=$BG
+width=360
+background-color=${BG}f0
 text-color=$FG
-border-color=$ACC
+border-color=$BG3
 border-size=1
-border-radius=8
-margin=12
-padding=12
+border-radius=10
+progress-color=over $ACC
+margin=50,8,8,8
+padding=12,16
+outer-margin=0
+format=<b>%s</b>\n%b
 default-timeout=5000
-max-visible=5
+max-visible=4
 icons=1
+max-icon-size=32
 layer=overlay
 anchor=top-right
+[urgency=normal]
+border-color=$ACC
 [urgency=high]
 border-color=$ERR
+default-timeout=0
 [urgency=low]
 border-color=$BG3
+text-color=$CMT
 EOF
 
   # ---- rofi (apps only: icon + name) ----
@@ -1126,7 +1275,9 @@ set_wp() {
   notify-send "wallpaper" "wallpaper set: $(basename "$1")" 2>/dev/null || true
 }
 
-pick() { find "$LIB" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.avif' \) -printf '%f\n' | sort | wmenu -p "wallpaper"; }
+[ -r "$HOME/.config/dwl/theme.sh" ] && . "$HOME/.config/dwl/theme.sh"
+menu() { wmenu -l 12 -p "$1" ${WMENU_ARGS[@]+"${WMENU_ARGS[@]}"}; }
+pick() { find "$LIB" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.avif' \) -printf '%f\n' | sort | menu "wallpaper"; }
 
 case "${1:-}" in
   --add) shift; for f in "$@"; do [[ -f "$f" ]] && cp -n "$f" "$LIB/" && notify-send "wallpaper" "added: $(basename "$f")" 2>/dev/null || true; done ;;
@@ -1169,7 +1320,7 @@ case "${1:-}" in
     curl -fL "$path" -o "$out" && set_wp "$out"
     ;;
   --menu)
-    sel=$(printf '%s\n' "Next wallpaper" "Random wallpaper" "Pick from library" "Browse library (imv)" "Fetch wallhaven top-30" "Add a wallpaper file" "Remove a wallpaper" | wmenu -p "wallpapers")
+    sel=$(printf '%s\n' "Next wallpaper" "Random wallpaper" "Pick from library" "Browse library (imv)" "Fetch wallhaven top-30" "Add a wallpaper file" "Remove a wallpaper" | menu "wallpapers")
     case "$sel" in
       "Next wallpaper") exec "$0" --next ;;
       "Random wallpaper") exec "$0" --random ;;
@@ -1177,7 +1328,8 @@ case "${1:-}" in
       "Browse library (imv)") exec "$0" --browse ;;
       "Fetch wallhaven top-30") exec "$0" --fetch ;;
       "Add a wallpaper file")
-        f=$(find "$HOME/Downloads" "$HOME/Pictures" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.webp' \) -printf '%f\n' 2>/dev/null | sort | wmenu -p "add from"); [[ -n "$f" ]] && "$0" --add "$HOME/Downloads/$f" 2>/dev/null || "$0" --add "$HOME/Pictures/$f" 2>/dev/null || true ;;
+        f=$(find "$HOME/Downloads" "$HOME/Pictures" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) 2>/dev/null | sort | menu "add from")
+        [[ -n "$f" && -f "$f" ]] && exec "$0" --add "$f" ;;
       "Remove a wallpaper") exec "$0" --remove ;;
     esac ;;
   *) [[ -f "$1" ]] && set_wp "$1" || exec "$0" --menu ;;
@@ -1240,7 +1392,8 @@ CMDS=(
 "" "" ""
 )
 menu="$(for i in "${!NAMES[@]}"; do printf '(%d) %s\n' "$i" "${NAMES[$i]}"; done)"
-sel="$(printf '%s\n' "$menu" | wmenu -l 20 -p "help (type to search)")" || exit 0
+[ -r "$HOME/.config/dwl/theme.sh" ] && . "$HOME/.config/dwl/theme.sh"
+sel="$(printf '%s\n' "$menu" | wmenu -l 20 -p "help (type to search)" ${WMENU_ARGS[@]+"${WMENU_ARGS[@]}"})" || exit 0
 [[ -n "$sel" ]] || exit 0
 n="${sel%%)*}"; n="${n#(}"
 cmd="${CMDS[$n]:-}"
@@ -1267,42 +1420,57 @@ satty -f "$shot"
 EOF
   cat <<'EOF' | theme_write 755 "$HOME/.local/bin/dwl-quick"
 #!/usr/bin/env bash
-# dwl-quick - quick settings menu (Super+X): brightness, volume, night light, screenshots, power.
+# dwl-quick - quick settings menu (Super+X). Items are matched by index, so
+# icons/labels can change freely without breaking the actions.
 set -uo pipefail
-notify() { notify-send "$1" "$2" 2>/dev/null || true; }
+[ -r "$HOME/.config/dwl/theme.sh" ] && . "$HOME/.config/dwl/theme.sh"
+notify() { notify-send -a "quick settings" "$1" "$2" 2>/dev/null || true; }
 night() {
   if pgrep -x gammastep >/dev/null 2>&1; then pkill -x gammastep; notify "Night light" "off"
-  else gammastep -O 3500 & disown; notify "Night light" "on (3500K)"; fi
+  else gammastep -O 3500 >/dev/null 2>&1 & disown; notify "Night light" "on (3500K)"; fi
 }
-sel=$(printf '%s\n' \
-  "☀  Brightness +5%" "☀  Brightness -5%" \
-  "🔊 Volume up" "🔊 Volume down" "🔇 Mute" \
-  "🌐 Ethernet status" "🌐 Network settings (nmtui)" \
-  "🔵 Bluetooth on/off" "🔵 Bluetooth manager" \
-  "🌙 Night light on/off" \
-  "📷 Region screenshot" "🖥  Full screenshot" \
-  "🖼  Next wallpaper" "🖼  Wallpaper picker" \
-  "🔒 Lock" "⏻ Power menu" \
-  | wmenu -l 16 -p "quick settings")
-case "$sel" in
-  "☀  Brightness +5%") brightnessctl set +5% ;;
-  "☀  Brightness -5%") brightnessctl set 5%- ;;
-  "🔊 Volume up")      swayosd-client --output-volume raise ;;
-  "🔊 Volume down")    swayosd-client --output-volume lower ;;
-  "🔇 Mute")           swayosd-client --output-volume mute-toggle ;;
-  "🌐 Ethernet status") notify "network" "$(nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null | tr '\n' ' ')" ;;
-  "🌐 Network settings (nmtui)") foot nmtui & disown ;;
-  "🔵 Bluetooth on/off")
-    if bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then bluetoothctl power off; notify "bluetooth" "off"
-    else bluetoothctl power on; notify "bluetooth" "on"; fi ;;
-  "🔵 Bluetooth manager") blueman-manager & disown ;;
-  "🌙 Night light on/off") night ;;
-  "📷 Region screenshot") dwl-screenshot region ;;
-  "🖥  Full screenshot")   dwl-screenshot full ;;
-  "🖼  Next wallpaper")    dwl-wallpaper --next ;;
-  "🖼  Wallpaper picker")  dwl-wallpaper --menu ;;
-  "🔒 Lock")           swaylock -f ;;
-  "⏻ Power menu")      wlogout 2>/dev/null || systemctl poweroff -i ;;
+bt_toggle() {
+  if bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then bluetoothctl power off >/dev/null; notify "Bluetooth" "off"
+  else bluetoothctl power on >/dev/null; notify "Bluetooth" "on"; fi
+}
+LABELS=(
+  "${I_BRIGHT:-*}  Brightness +5%"
+  "${I_DIM:-*}  Brightness -5%"
+  "${I_VOL:-*}  Volume up"
+  "${I_VOLD:-*}  Volume down"
+  "${I_MUTE:-*}  Mute"
+  "${I_ETH:-*}  Network status"
+  "${I_NETCFG:-*}  Network settings"
+  "${I_BT:-*}  Bluetooth on/off"
+  "${I_BTCFG:-*}  Bluetooth devices"
+  "${I_NIGHT:-*}  Night light"
+  "${I_SHOT:-*}  Region screenshot"
+  "${I_SCREEN:-*}  Full screenshot"
+  "${I_WALL:-*}  Next wallpaper"
+  "${I_WALLS:-*}  Wallpaper picker"
+  "${I_LOCK:-*}  Lock"
+  "${I_POWER:-*}  Power"
+)
+sel="$(for i in "${!LABELS[@]}"; do printf '%02d  %s\n' "$i" "${LABELS[$i]}"; done \
+      | wmenu -l 16 -p "quick settings" ${WMENU_ARGS[@]+"${WMENU_ARGS[@]}"})" || exit 0
+[[ -n "$sel" ]] || exit 0
+case "$((10#${sel:0:2}))" in
+  0)  brightnessctl set +5% >/dev/null ;;
+  1)  brightnessctl set 5%- >/dev/null ;;
+  2)  swayosd-client --output-volume raise ;;
+  3)  swayosd-client --output-volume lower ;;
+  4)  swayosd-client --output-volume mute-toggle ;;
+  5)  notify "Network" "$(nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null | grep -v ':loopback:' | tr '\n' ' ')" ;;
+  6)  foot nmtui & disown ;;
+  7)  bt_toggle ;;
+  8)  blueman-manager & disown ;;
+  9)  night ;;
+  10) dwl-screenshot region ;;
+  11) dwl-screenshot full ;;
+  12) dwl-wallpaper --next ;;
+  13) dwl-wallpaper --menu ;;
+  14) swaylock -f ;;
+  15) wlogout 2>/dev/null || systemctl poweroff -i ;;
 esac
 EOF
 
@@ -2001,7 +2169,7 @@ verify_theme() {
            "$HOME/.config/fastfetch/config.jsonc" "$HOME/.config/gtk-3.0/settings.ini" "$HOME/.config/gtk-4.0/settings.ini" \
            "$HOME/.config/qt6ct/qt6ct.conf" "$HOME/.config/qt5ct/qt5ct.conf" "$HOME/.config/dwl/wallpaper.png" \
            "$HOME/.local/bin/dwl-wallpaper" "$HOME/.local/bin/dwl-quick" "$HOME/.local/bin/dwl-screenshot" \
-           "$HOME/.local/bin/dwl-help" \
+           "$HOME/.local/bin/dwl-help" "$HOME/.config/dwl/theme.sh" \
            /etc/tuigreet/config.toml; do
     [[ -s "$f" ]] && t_pass "$f" || t_fail "$f missing or empty"
   done
