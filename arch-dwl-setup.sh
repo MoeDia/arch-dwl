@@ -45,7 +45,7 @@
 # =============================================================================
 set -uo pipefail
 
-DWLSETUP_VER="3.0"
+DWLSETUP_VER="4.0"
 
 : "${SKIP:=}"
 : "${AUR_REVIEW:=0}"
@@ -205,10 +205,37 @@ pac() {  # sudo pacman with stale-lock cleanup + 3 tries (mirror hiccups, slow s
 
 is_repo_pkg() { pacman -Si "$1" >/dev/null 2>&1 || pacman -Sp "$1" >/dev/null 2>&1; }
 
-paru_ready() {  # make sure an AUR helper is usable right now; repair if not
-  paru_healthy && return 0
-  warn "paru is missing or broken - repairing it before building AUR packages"
-  fix_paru
+# AUR packages are built with plain makepkg straight from aur.archlinux.org (the
+# method the AUR wiki documents). No AUR helper is involved, so no helper can
+# break the install. AUR-only dependencies are built first, recursively.
+AUR_BUILD="${AUR_BUILD:-$HOME/.cache/aur-build}"
+aur_install() {
+  local depth="${AUR_DEPTH:-0}" pkg dir dep
+  (( depth < 4 )) || { warn "AUR dependency chain too deep - stopping"; return 1; }
+  for pkg in "$@"; do
+    pacman -Qq "$pkg" >/dev/null 2>&1 && continue
+    dir="$AUR_BUILD/$pkg"
+    rm -rf "$dir"; mkdir -p "$AUR_BUILD"
+    if ! git clone -q --depth=1 "https://aur.archlinux.org/$pkg.git" "$dir" 2>/dev/null; then
+      warn "AUR has no package named '$pkg' (renamed or removed?)"; FAILED+=("$pkg"); continue
+    fi
+    # AUR-only depends: build them first (repo depends are handled by makepkg -s).
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+      is_repo_pkg "$dep" && continue
+      pacman -Qq "$dep" >/dev/null 2>&1 && continue
+      AUR_DEPTH=$((depth + 1)) aur_install "$dep"
+    done < <(cd "$dir" && makepkg --printsrcinfo 2>/dev/null \
+             | awk -F' = ' '/^[[:space:]]*(make|check)?depends[[:space:]]*=/{print $2}' \
+             | sed 's/[<>=].*$//' | sort -u)
+    pacman_unlock
+    if (cd "$dir" && makepkg -si --noconfirm --needed >"$dir/build.log" 2>&1); then
+      info "installed AUR: $pkg"
+    else
+      FAILED+=("$pkg"); warn "AUR build failed: $pkg (full log: $dir/build.log)"
+    fi
+  done
+  return 0
 }
 
 # Install packages. Official-repo packages go through pacman directly (a broken
@@ -225,16 +252,7 @@ inst() {
     fi
   fi
   if ((${#aur[@]})); then
-    if ! paru_ready; then
-      for p in "${aur[@]}"; do FAILED+=("$p"); done
-      warn "no working paru - skipped AUR packages: ${aur[*]}"
-      return 0
-    fi
-    pacman_unlock
-    if ! paru -S --needed "${PARU_FLAGS[@]}" "${aur[@]}"; then
-      warn "AUR batch failed, retrying one by one"
-      for p in "${aur[@]}"; do paru -S --needed "${PARU_FLAGS[@]}" "$p" || { FAILED+=("$p"); warn "FAILED: $p"; }; done
-    fi
+    aur_install "${aur[@]}"
   fi
   return 0
 }
@@ -245,7 +263,7 @@ inst_any() {
   for p in "$@"; do
     if is_repo_pkg "$p"; then
       pac -S --needed --noconfirm "$p" && return 0
-    elif paru_ready && paru -S --needed "${PARU_FLAGS[@]}" "$p"; then
+    elif aur_install "$p" && pacman -Qq "$p" >/dev/null 2>&1; then
       return 0
     fi
   done
@@ -347,19 +365,22 @@ phase_pacman() {
   pac -Syu --noconfirm || die "System upgrade failed 3 times (mirrors? disk full? run 'sudo pacman -Syu' by hand to see why)."
   pac -S --needed --noconfirm base-devel git curl pacman-contrib || die "base-devel install failed."
   sudo systemctl enable --now paccache.timer fstrim.timer || warn "Could not enable paccache/fstrim timers."
-  # A pacman upgrade changes libalpm and can break an installed paru on the spot.
-  # base-devel/git exist now, so repair is possible. Not fatal: repo packages use
-  # pacman directly; only AUR packages need paru.
-  if command -v paru >/dev/null && ! paru_healthy; then
-    warn "the system upgrade broke the existing paru - repairing now"
-    fix_paru || warn "paru repair failed here; the paru phase will try again (repo packages are unaffected)"
-  fi
 }
 
 phase_paru() {
-  log "AUR helper (paru)"
-  if paru_healthy; then info "paru $(paru --version 2>/dev/null | head -1 | awk '{print $2}') installed and working"; return 0; fi
-  fix_paru || warn "Could not get a working paru. Official-repo packages still install; AUR packages will be listed as FAILED. Fix by hand: see the book, 'paru broke after an upgrade', then re-run."
+  log "AUR toolchain (makepkg - no AUR helper needed)"
+  inst git base-devel
+  # A paru left broken by an earlier libalpm mismatch is harmless now, but it
+  # would confuse you and can hold a stale libalpm. Remove it once, cleanly.
+  if ! paru_healthy; then
+    for p in paru paru-bin paru-debug; do
+      if pacman -Qq "$p" >/dev/null 2>&1; then
+        warn "removing broken $p (AUR builds use makepkg now, nothing depends on it)"
+        sudo pacman -Rdd --noconfirm "$p" >/dev/null 2>&1 || warn "could not remove $p - remove it by hand: sudo pacman -Rdd $p"
+      fi
+    done
+  fi
+  info "AUR packages are fetched from aur.archlinux.org and built with makepkg"
 }
 
 # ------------------------------------------------------------ 2. security ----
@@ -1374,7 +1395,7 @@ NAMES=(
 "SYSTEM — lock screen"
 "SYSTEM — power menu (wlogout)"
 "SYSTEM — night light on/off (3500K)"
-"SYSTEM — update everything (paru -Syu)"
+"SYSTEM — update everything (sudo pacman -Syu)"
 "SYSTEM — rebuild dwl from config.h"
 "LEARN — search all torrents: Prowlarr at localhost:9696"
 "LEARN — re-run the system test suite"
@@ -1388,7 +1409,7 @@ CMDS=(
 "" "foot nmtui" "foot bluetoothctl" "blueman-manager"
 "foot yazi" "foot btop" "foot calc" "gsimplecal" "foot claude"
 "swaylock -f" "wlogout" "pkill -x gammastep || (gammastep -O 3500 &)"
-"foot sh -c 'paru -Syu; echo DONE; read -r _'" "foot sh -c 'dwl-rebuild; echo DONE; read -r _'"
+"foot sh -c 'sudo pacman -Syu; echo DONE; read -r _'" "foot sh -c 'dwl-rebuild; echo DONE; read -r _'"
 "" "" ""
 )
 menu="$(for i in "${!NAMES[@]}"; do printf '(%d) %s\n' "$i" "${NAMES[$i]}"; done)"
